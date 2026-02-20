@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>USDC/USDT Spreads (Jupiter)</title>
+  <style>
+    body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; padding: 20px; }
+    table { border-collapse: collapse; width: 520px; }
+    th, td { border: 1px solid #ddd; padding: 10px; text-align: right; }
+    th { text-align: left; }
+    .small { color:#666; font-size: 12px; margin-top: 10px; }
+  </style>
+</head>
+<body>
+  <h2>USDC/USDT spread (bps) via Jupiter quotes</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Size (USD)</th>
+        <th>Bid (USDT/USDC)</th>
+        <th>Ask (USDT/USDC)</th>
+        <th>Spread (bps)</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <div class="small" id="status"></div>
+
+<script>
+  // Solana mints
+  const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+
+  // both are 6 decimals on Solana
+  const DECIMALS = 1_000_000;
+
+  const SIZES_USD = [1000, 10_000, 50_000, 100_000];
+
+  async function jupQuote(inputMint, outputMint, amountAtoms) {
+    const url = new URL("https://quote-api.jup.ag/v6/quote");
+    url.searchParams.set("inputMint", inputMint);
+    url.searchParams.set("outputMint", outputMint);
+    url.searchParams.set("amount", String(amountAtoms));
+    url.searchParams.set("swapMode", "ExactIn");
+    // optional: url.searchParams.set("onlyDirectRoutes", "true"); // if you want
+    const res = await fetch(url.toString(), { headers: { "accept": "application/json" }});
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  }
+
+  function fmt(x, d=9) {
+    if (!Number.isFinite(x)) return "—";
+    return x.toFixed(d);
+  }
+
+  async function update() {
+    const tbody = document.getElementById("rows");
+    const status = document.getElementById("status");
+    status.textContent = "Updating…";
+
+    const out = [];
+
+    for (const usd of SIZES_USD) {
+      const amt = Math.round(usd * DECIMALS); // 1k USDC ~= 1k USD, same for USDT
+
+      // Bid: sell USDC -> USDT (ExactIn)
+      const qBid = await jupQuote(USDC, USDT, amt);
+      const bid_out = Number(qBid.outAmount);     // USDT atoms received
+      const bid_in  = Number(qBid.inAmount);      // USDC atoms sold (= amt)
+      const bid = bid_out / bid_in;               // USDT per USDC
+
+      // Ask: sell USDT -> USDC (ExactIn), then invert to USDT/USDC
+      const qAsk = await jupQuote(USDT, USDC, amt);
+      const ask_in  = Number(qAsk.inAmount);      // USDT atoms sold (= amt)
+      const ask_out = Number(qAsk.outAmount);     // USDC atoms received
+      const ask = ask_in / ask_out;               // USDT per USDC
+
+      const spread_bps = (ask / bid - 1) * 10_000;
+
+      out.push({ usd, bid, ask, spread_bps });
+    }
+
+    tbody.innerHTML = out.map(r => `
+      <tr>
+        <td>${r.usd.toLocaleString()}</td>
+        <td>${fmt(r.bid, 9)}</td>
+        <td>${fmt(r.ask, 9)}</td>
+        <td>${fmt(r.spread_bps, 4)}</td>
+      </tr>
+    `).join("");
+
+    status.textContent = `Last update: ${new Date().toLocaleTimeString()} (refreshes every 5s)`;
+  }
+
+  update();
+  setInterval(update, 5000);
+</script>
+</body>
+</html>
