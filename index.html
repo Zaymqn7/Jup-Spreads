@@ -6,14 +6,24 @@
   <title>USDC/USDT Spreads (Jupiter)</title>
   <style>
     body { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; padding: 20px; }
-    table { border-collapse: collapse; width: 520px; }
+    table { border-collapse: collapse; width: 640px; }
     th, td { border: 1px solid #ddd; padding: 10px; text-align: right; }
     th { text-align: left; }
     .small { color:#666; font-size: 12px; margin-top: 10px; }
+    .err { color:#b00020; }
+    .ok  { color:#0b6b0b; }
+    button { font-family: inherit; padding: 6px 10px; margin-left: 8px; }
   </style>
 </head>
 <body>
   <h2>USDC/USDT spread (bps) via Jupiter quotes</h2>
+
+  <div class="small">
+    API key: <span id="keyState">checking…</span>
+    <button id="setKeyBtn" type="button">Set API key</button>
+    <button id="clearKeyBtn" type="button">Clear</button>
+  </div>
+
   <table>
     <thead>
       <tr>
@@ -25,28 +35,75 @@
     </thead>
     <tbody id="rows"></tbody>
   </table>
+
   <div class="small" id="status"></div>
+  <div class="small err" id="lastError"></div>
 
 <script>
   // Solana mints
   const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
   const USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
 
-  // both are 6 decimals on Solana
+  // USDC/USDT on Solana are 6 decimals (atoms)
   const DECIMALS = 1_000_000;
 
   const SIZES_USD = [1000, 10_000, 50_000, 100_000];
 
+  // Refresh every 20s => 8 requests/update => 24 req/min (safe vs free tier 60 rpm if using api.jup.ag key)
+  const REFRESH_MS = 20_000;
+
+  function getApiKey() {
+    return (localStorage.getItem("JUP_API_KEY") || "").trim();
+  }
+
+  function updateKeyUI() {
+    const k = getApiKey();
+    const el = document.getElementById("keyState");
+    if (k) {
+      el.textContent = "set (using api.jup.ag)";
+      el.className = "ok";
+    } else {
+      el.textContent = "not set (using lite-api.jup.ag fallback)";
+      el.className = "err";
+    }
+  }
+
+  function baseUrl() {
+    // Prefer api.jup.ag (requires x-api-key). Fallback to lite-api.jup.ag if no key.
+    return getApiKey() ? "https://api.jup.ag" : "https://lite-api.jup.ag";
+  }
+
   async function jupQuote(inputMint, outputMint, amountAtoms) {
-    const url = new URL("https://quote-api.jup.ag/v6/quote");
+    // Docs: GET /swap/v1/quote with inputMint, outputMint, amount, slippageBps, swapMode
+    const url = new URL(baseUrl() + "/swap/v1/quote");
     url.searchParams.set("inputMint", inputMint);
     url.searchParams.set("outputMint", outputMint);
-    url.searchParams.set("amount", String(amountAtoms));
+    url.searchParams.set("amount", String(amountAtoms));     // raw amount before decimals
     url.searchParams.set("swapMode", "ExactIn");
-    // optional: url.searchParams.set("onlyDirectRoutes", "true"); // if you want
-    const res = await fetch(url.toString(), { headers: { "accept": "application/json" }});
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    return res.json();
+    url.searchParams.set("slippageBps", "1");
+
+    const headers = { "accept": "application/json" };
+    const k = getApiKey();
+    if (k) headers["x-api-key"] = k;
+
+    const res = await fetch(url.toString(), { headers });
+    const text = await res.text();
+
+    // Make errors visible & debuggable
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} from ${url.hostname}: ${text.slice(0, 200)}`);
+    }
+
+    let json;
+    try { json = JSON.parse(text); }
+    catch (e) { throw new Error(`Bad JSON from ${url.hostname}: ${text.slice(0, 200)}`); }
+
+    // Basic shape checks (docs: inAmount/outAmount are strings)
+    if (!json || typeof json.outAmount !== "string" || typeof json.inAmount !== "string") {
+      throw new Error(`Unexpected response shape from ${url.hostname}: ${text.slice(0, 200)}`);
+    }
+
+    return json;
   }
 
   function fmt(x, d=9) {
@@ -57,28 +114,35 @@
   async function update() {
     const tbody = document.getElementById("rows");
     const status = document.getElementById("status");
+    const lastError = document.getElementById("lastError");
+
     status.textContent = "Updating…";
+    lastError.textContent = "";
 
     const out = [];
 
     for (const usd of SIZES_USD) {
-      const amt = Math.round(usd * DECIMALS); // 1k USDC ~= 1k USD, same for USDT
+      const amt = Math.round(usd * DECIMALS);
 
-      // Bid: sell USDC -> USDT (ExactIn)
-      const qBid = await jupQuote(USDC, USDT, amt);
-      const bid_out = Number(qBid.outAmount);     // USDT atoms received
-      const bid_in  = Number(qBid.inAmount);      // USDC atoms sold (= amt)
-      const bid = bid_out / bid_in;               // USDT per USDC
+      try {
+        // Bid: sell USDC -> USDT (ExactIn)
+        const qBid = await jupQuote(USDC, USDT, amt);
+        const bid_out = Number(qBid.outAmount); // USDT atoms received
+        const bid_in  = Number(qBid.inAmount);  // USDC atoms sold
+        const bid = bid_out / bid_in;           // USDT per USDC
 
-      // Ask: sell USDT -> USDC (ExactIn), then invert to USDT/USDC
-      const qAsk = await jupQuote(USDT, USDC, amt);
-      const ask_in  = Number(qAsk.inAmount);      // USDT atoms sold (= amt)
-      const ask_out = Number(qAsk.outAmount);     // USDC atoms received
-      const ask = ask_in / ask_out;               // USDT per USDC
+        // Ask: sell USDT -> USDC (ExactIn), invert to USDT/USDC
+        const qAsk = await jupQuote(USDT, USDC, amt);
+        const ask_in  = Number(qAsk.inAmount);  // USDT atoms sold
+        const ask_out = Number(qAsk.outAmount); // USDC atoms received
+        const ask = ask_in / ask_out;           // USDT per USDC
 
-      const spread_bps = (ask / bid - 1) * 10_000;
+        const spread_bps = (ask / bid - 1) * 10_000;
 
-      out.push({ usd, bid, ask, spread_bps });
+        out.push({ usd, bid, ask, spread_bps });
+      } catch (e) {
+        out.push({ usd, bid: NaN, ask: NaN, spread_bps: NaN, err: String(e?.message || e) });
+      }
     }
 
     tbody.innerHTML = out.map(r => `
@@ -90,11 +154,31 @@
       </tr>
     `).join("");
 
-    status.textContent = `Last update: ${new Date().toLocaleTimeString()} (refreshes every 5s)`;
+    const errs = out.filter(x => x.err).map(x => `${x.usd}: ${x.err}`);
+    if (errs.length) lastError.textContent = "Errors: " + errs.join(" | ");
+
+    status.textContent = `Last update: ${new Date().toLocaleTimeString()} • host=${new URL(baseUrl()).hostname} • refresh=${REFRESH_MS/1000}s`;
   }
 
+  // Key buttons
+  document.getElementById("setKeyBtn").addEventListener("click", () => {
+    const k = prompt("Paste your Jupiter API key (stored in this browser via localStorage as JUP_API_KEY):");
+    if (k && k.trim()) {
+      localStorage.setItem("JUP_API_KEY", k.trim());
+      updateKeyUI();
+      update();
+    }
+  });
+
+  document.getElementById("clearKeyBtn").addEventListener("click", () => {
+    localStorage.removeItem("JUP_API_KEY");
+    updateKeyUI();
+    update();
+  });
+
+  updateKeyUI();
   update();
-  setInterval(update, 5000);
+  setInterval(update, REFRESH_MS);
 </script>
 </body>
 </html>
